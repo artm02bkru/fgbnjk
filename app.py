@@ -1,264 +1,349 @@
-import cv2
+"""RTSP Viewer + Map.
+
+Flask-сервер, который забирает RTSP/HTTP/файловые видеопотоки через OpenCV,
+раздаёт их в браузер как MJPEG и показывает камеры на карте (Leaflet).
+
+Запуск:  python app.py            (конфиг: cameras.json или cameras.example.json)
+         CAMERAS_FILE=my.json PORT=8080 python app.py
+"""
+import json
+import logging
+import os
 import threading
 import time
-from flask import Flask, Response, render_template_string
+from pathlib import Path
+
+# Таймауты FFMPEG задаются до импорта cv2: иначе недоступная камера
+# блокирует открытие/чтение потока на ~30 секунд.
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|timeout;5000000|stimeout;5000000",
+)
+
+import cv2  # noqa: E402
+from flask import Flask, Response, abort, jsonify, render_template  # noqa: E402
+
+BASE_DIR = Path(__file__).resolve().parent
+
+log = logging.getLogger("rtsp-viewer")
 
 # ================= НАСТРОЙКИ =================
-# Укажите здесь ваши камеры: имя, URL и координаты (широта, долгота)
-CAMERAS = [
-    {
-        "id": 1,
-        "name": "Камера 1",
-        "url": "rtsp://user:pass@192.168.1.10:554/stream1",
-        "lat": 55.7558,
-        "lng": 37.6173
-    },
-    {
-        "id": 2,
-        "name": "Камера 2",
-        "url": "rtsp://user:pass@192.168.1.11:554/stream1",
-        "lat": 55.7600,
-        "lng": 37.6200
-    }
-    # Добавляйте свои камеры по аналогии
-]
-
-# Начальный центр карты (если не хотите вычислять автоматически)
-MAP_CENTER = [55.7558, 37.6173]
-MAP_ZOOM = 13
-
-# Порт веб-сервера
-PORT = 5000
+DEFAULTS = {
+    "map_center": [55.7558, 37.6173],
+    "map_zoom": 13,
+    "port": 5000,
+    "jpeg_quality": 80,
+    "max_width": 960,        # кадры шире ужимаются перед кодированием (0 = не ужимать)
+    "max_fps": 15,           # ограничение FPS раздачи
+    "idle_timeout": 30,      # сек. без зрителей -> поток останавливается
+    "open_timeout_ms": 5000,
+    "read_timeout_ms": 5000,
+    "reconnect_min": 1,      # сек., начальная пауза переподключения
+    "reconnect_max": 30,     # сек., максимальная пауза переподключения
+    "cameras": [],
+}
 # =============================================
 
 
-app = Flask(__name__)
-
-# Класс для захвата и раздачи потока
-class CameraStream:
-    def __init__(self, rtsp_url):
-        self.rtsp_url = rtsp_url
-        self.cap = None
-        self.lock = threading.Lock()
-        self.frame = None
-        self.running = True
-        self.connect()
-
-    def connect(self):
-        """Подключение к RTSP"""
-        try:
-            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
-            if not self.cap.isOpened():
-                print(f"Не удалось открыть поток: {self.rtsp_url}")
-                self.cap = None
-        except Exception as e:
-            print(f"Ошибка подключения к {self.rtsp_url}: {e}")
-            self.cap = None
-
-    def get_frame(self):
-        """Получение кадра (MJPEG)"""
-        if self.cap is None:
-            # Попытка переподключения
-            self.connect()
-            return None
-
-        with self.lock:
-            ret, frame = self.cap.read()
-            if not ret:
-                # Переподключение при потере кадра
-                self.cap.release()
-                self.connect()
-                return None
-
-            # Кодирование в JPEG для MJPEG
-            ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            if not ret:
-                return None
-            return jpeg.tobytes()
-
-    def release(self):
-        self.running = False
-        if self.cap:
-            self.cap.release()
-
-
-# Хранилище потоков
-streams = {}
-
-
-def get_stream(cam_id):
-    """Получить или создать поток для камеры"""
-    if cam_id not in streams:
-        for cam in CAMERAS:
-            if cam["id"] == cam_id:
-                streams[cam_id] = CameraStream(cam["url"])
-                break
-    return streams.get(cam_id)
-
-
-def generate_frames(cam_id):
-    """Генератор MJPEG кадров для Flask"""
-    stream = get_stream(cam_id)
-    if not stream:
-        return
-
-    while True:
-        frame = stream.get_frame()
-        if frame:
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-        else:
-            time.sleep(0.5)  # Пауза при ошибке
-
-
-@app.route('/video/<int:cam_id>')
-def video_feed(cam_id):
-    """Эндпоинт для MJPEG потока"""
-    return Response(generate_frames(cam_id),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
-
-# HTML шаблон (карта + видео)
-HTML_TEMPLATE = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>RTSP Viewer + Map</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <!-- Leaflet CSS -->
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: Arial, sans-serif; background: #1a1a1a; color: #fff; }
-        #container { display: flex; height: 100vh; }
-        #sidebar {
-            width: 400px;
-            background: #2a2a2a;
-            padding: 15px;
-            overflow-y: auto;
-            border-right: 1px solid #444;
-        }
-        #map-container { flex: 1; position: relative; }
-        #map { width: 100%; height: 100%; }
-        .camera-card {
-            background: #333;
-            border-radius: 8px;
-            margin-bottom: 15px;
-            padding: 10px;
-            border: 1px solid #555;
-        }
-        .camera-card h3 {
-            margin-bottom: 8px;
-            font-size: 14px;
-            color: #4fc3f7;
-        }
-        .camera-card img {
-            width: 100%;
-            border-radius: 4px;
-            background: #000;
-            min-height: 150px;
-        }
-        .camera-card .coords {
-            font-size: 11px;
-            color: #999;
-            margin-top: 5px;
-        }
-        .camera-card .status {
-            font-size: 11px;
-            color: #4caf50;
-        }
-    </style>
-</head>
-<body>
-    <div id="container">
-        <div id="sidebar">
-            <h2 style="margin-bottom: 15px;">📹 Камеры</h2>
-            {% for cam in cameras %}
-            <div class="camera-card" id="card-{{ cam.id }}">
-                <h3>{{ cam.name }} (ID: {{ cam.id }})</h3>
-                <img src="/video/{{ cam.id }}" alt="Поток {{ cam.name }}" 
-                     onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22300%22 height=%22200%22><rect fill=%22%23333%22 width=%22300%22 height=%22200%22/><text fill=%22%23f44%22 x=%2250%25%22 y=%2250%25%22 text-anchor=%22middle%22>Ошибка потока</text></svg>'">
-                <div class="coords">📍 {{ cam.lat }}, {{ cam.lng }}</div>
-                <div class="status">● Подключено</div>
-            </div>
-            {% endfor %}
-        </div>
-        <div id="map-container">
-            <div id="map"></div>
-        </div>
-    </div>
-
-    <!-- Leaflet JS -->
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <script>
-        // Данные камер из Python
-        const cameras = {{ cameras_json | safe }};
-        const mapCenter = {{ map_center_json | safe }};
-        const mapZoom = {{ map_zoom }};
-
-        // Инициализация карты
-        const map = L.map('map').setView(mapCenter, mapZoom);
-
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            attribution: '© OpenStreetMap contributors',
-            maxZoom: 19
-        }).addTo(map);
-
-        // Маркеры камер
-        cameras.forEach(cam => {
-            const marker = L.marker([cam.lat, cam.lng]).addTo(map);
-            
-            // Всплывающее окно с превью
-            const popupContent = `
-                <div style="width: 280px;">
-                    <b>${cam.name}</b><br>
-                    <img src="/video/${cam.id}" style="width: 100%; margin-top: 5px; border-radius: 4px;">
-                </div>
-            `;
-            marker.bindPopup(popupContent, { maxWidth: 300 });
-
-            // Подсветка карточки при клике на маркер
-            marker.on('click', () => {
-                document.querySelectorAll('.camera-card').forEach(c => c.style.borderColor = '#555');
-                const card = document.getElementById(`card-${cam.id}`);
-                if (card) card.style.borderColor = '#4fc3f7';
-            });
-        });
-
-        // Автоматическое построение границ по всем камерам (если их больше одной)
-        if (cameras.length > 1) {
-            const bounds = L.latLngBounds(cameras.map(c => [c.lat, c.lng]));
-            map.fitBounds(bounds, { padding: [50, 50] });
-        }
-    </script>
-</body>
-</html>
-'''
-
-
-@app.route('/')
-def index():
-    """Главная страница с картой и видео"""
-    import json
-    cameras_json = json.dumps(CAMERAS)
-    # Автоматическое определение центра карты, если камер несколько
-    if len(CAMERAS) > 1:
-        center = [sum(c['lat'] for c in CAMERAS)/len(CAMERAS),
-                  sum(c['lng'] for c in CAMERAS)/len(CAMERAS)]
+def load_config():
+    """Читает конфиг: $CAMERAS_FILE -> cameras.json -> cameras.example.json."""
+    candidates = [os.environ.get("CAMERAS_FILE"), BASE_DIR / "cameras.json",
+                  BASE_DIR / "cameras.example.json"]
+    for path in candidates:
+        if path and Path(path).is_file():
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            log.info("Конфиг загружен: %s", path)
+            break
     else:
-        center = MAP_CENTER
+        log.warning("Конфиг не найден, камер нет")
+        data = {}
 
-    return render_template_string(
-        HTML_TEMPLATE,
-        cameras=CAMERAS,
-        cameras_json=cameras_json,
-        map_center_json=json.dumps(center),
-        map_zoom=MAP_ZOOM
-    )
+    cfg = {**DEFAULTS, **data}
+    if os.environ.get("PORT"):
+        cfg["port"] = int(os.environ["PORT"])
+
+    ids = set()
+    for cam in cfg["cameras"]:
+        for key in ("id", "name", "url", "lat", "lng"):
+            if key not in cam:
+                raise ValueError(f"У камеры {cam} нет поля '{key}'")
+        if cam["id"] in ids:
+            raise ValueError(f"Повторяющийся id камеры: {cam['id']}")
+        ids.add(cam["id"])
+        url = str(cam["url"])
+        # Локальный файл относительно папки проекта (удобно для демо)
+        if "://" not in url and not Path(url).is_absolute():
+            cam["url"] = str(BASE_DIR / url)
+    return cfg
 
 
-if __name__ == '__main__':
-    # Запуск сервера
+def make_placeholder(text="NO SIGNAL", size=(640, 360)):
+    """JPEG-заглушка, которую получают зрители, пока камера недоступна."""
+    import numpy as np
+    w, h = size
+    img = np.full((h, w, 3), 40, dtype=np.uint8)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), _ = cv2.getTextSize(text, font, 1.4, 3)
+    cv2.putText(img, text, ((w - tw) // 2, (h + th) // 2), font, 1.4,
+                (80, 80, 240), 3, cv2.LINE_AA)
+    return cv2.imencode(".jpg", img)[1].tobytes()
+
+
+def public_camera(cam):
+    """Данные камеры, безопасные для отдачи в браузер (без URL с паролями)."""
+    return {k: cam[k] for k in ("id", "name", "lat", "lng")}
+
+
+class CameraStream:
+    """Читает поток в фоновом потоке и хранит последний JPEG-кадр.
+
+    Все зрители одной камеры получают один и тот же кадр, поэтому камера
+    открывается один раз, сколько бы вкладок/превью ни было открыто.
+    Поток запускается при первом зрителе и останавливается после
+    `idle_timeout` секунд без зрителей.
+    """
+
+    def __init__(self, cam, cfg):
+        self.cam = cam
+        self.url = cam["url"]
+        self.cfg = cfg
+        self.is_file = "://" not in self.url
+        self.cond = threading.Condition()
+        self.frame = None
+        self.frame_id = 0
+        self.frame_time = 0.0
+        self.state = "idle"      # idle | connecting | online | offline
+        self.error = None
+        self.fps = 0.0
+        self.last_access = 0.0
+        self.thread = None
+        self.stop_event = threading.Event()
+
+    # ---------- жизненный цикл ----------
+    def touch(self):
+        """Отметить зрителя и при необходимости запустить поток."""
+        with self.cond:
+            self.last_access = time.monotonic()
+            if self.thread is None or not self.thread.is_alive():
+                self.stop_event.clear()
+                self.state = "connecting"
+                self.thread = threading.Thread(
+                    target=self._run, name=f"cam-{self.cam['id']}", daemon=True)
+                self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join(timeout=5)
+
+    def _open(self):
+        cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG, [
+            cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self.cfg["open_timeout_ms"],
+            cv2.CAP_PROP_READ_TIMEOUT_MSEC, self.cfg["read_timeout_ms"],
+        ])
+        if not cap.isOpened():
+            cap.release()
+            return None
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except cv2.error:
+            pass
+        return cap
+
+    def _run(self):
+        backoff = self.cfg["reconnect_min"]
+        while not self.stop_event.is_set():
+            if self._idle():
+                break
+            self._set_state("connecting")
+            cap = self._open()
+            if cap is None:
+                self._set_state("offline", "не удалось открыть поток")
+                log.warning("[%s] не удалось открыть поток, повтор через %ss",
+                            self.cam["name"], backoff)
+                if self.stop_event.wait(backoff):
+                    break
+                backoff = min(backoff * 2, self.cfg["reconnect_max"])
+                continue
+
+            log.info("[%s] подключено", self.cam["name"])
+            backoff = self.cfg["reconnect_min"]
+            try:
+                self._read_loop(cap)
+            finally:
+                cap.release()
+        self._set_state("idle")
+        log.info("[%s] поток остановлен", self.cam["name"])
+
+    def _read_loop(self, cap):
+        src_fps = cap.get(cv2.CAP_PROP_FPS) or 0
+        max_fps = self.cfg["max_fps"] or 0
+        # Файлы читаются мгновенно — ограничиваем их родным FPS
+        pace = src_fps if self.is_file and 0 < src_fps < 120 else 0
+        if max_fps and (not pace or pace > max_fps):
+            pace = max_fps
+        min_interval = 1.0 / pace if pace else 0
+        encode_interval = 1.0 / max_fps if max_fps else 0
+
+        last_encode = 0.0
+        fps_count, fps_start = 0, time.monotonic()
+        while not self.stop_event.is_set():
+            if self._idle():
+                return
+            t0 = time.monotonic()
+            ok, frame = cap.read()
+            if not ok:
+                if self.is_file:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)   # зацикливаем файл
+                    ok, frame = cap.read()
+                if not ok:
+                    self._set_state("offline", "поток прервался")
+                    log.warning("[%s] поток прервался, переподключение",
+                                self.cam["name"])
+                    return
+
+            now = time.monotonic()
+            if now - last_encode >= encode_interval:
+                last_encode = now
+                jpeg = self._encode(frame)
+                if jpeg is not None:
+                    self._publish(jpeg)
+                    fps_count += 1
+
+            if now - fps_start >= 2:
+                self.fps = round(fps_count / (now - fps_start), 1)
+                fps_count, fps_start = 0, now
+
+            if min_interval:
+                delay = min_interval - (time.monotonic() - t0)
+                if delay > 0:
+                    self.stop_event.wait(delay)
+
+    def _encode(self, frame):
+        max_w = self.cfg["max_width"]
+        if max_w and frame.shape[1] > max_w:
+            h = int(frame.shape[0] * max_w / frame.shape[1])
+            frame = cv2.resize(frame, (max_w, h), interpolation=cv2.INTER_AREA)
+        ok, jpeg = cv2.imencode(
+            ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.cfg["jpeg_quality"]])
+        return jpeg.tobytes() if ok else None
+
+    def _publish(self, jpeg):
+        with self.cond:
+            self.frame = jpeg
+            self.frame_id += 1
+            self.frame_time = time.time()
+            self.state = "online"
+            self.error = None
+            self.cond.notify_all()
+
+    def _set_state(self, state, error=None):
+        with self.cond:
+            self.state = state
+            self.error = error
+            if state != "online":
+                self.fps = 0.0
+            self.cond.notify_all()
+
+    def _idle(self):
+        return time.monotonic() - self.last_access > self.cfg["idle_timeout"]
+
+    # ---------- для клиентов ----------
+    def wait_frame(self, last_id, timeout=1.0):
+        """Ждёт кадр новее last_id. Возвращает (frame_id, jpeg) или (last_id, None)."""
+        self.touch()
+        with self.cond:
+            self.cond.wait_for(lambda: self.frame_id != last_id, timeout=timeout)
+            if self.frame_id != last_id and self.frame is not None:
+                return self.frame_id, self.frame
+            return last_id, None
+
+    def status(self):
+        with self.cond:
+            return {
+                "state": self.state,
+                "error": self.error,
+                "fps": self.fps,
+                "last_frame": self.frame_time or None,
+            }
+
+
+def create_app(cfg=None):
+    cfg = cfg or load_config()
+    app = Flask(__name__)
+    app.config["VIEWER"] = cfg
+
+    cameras = {cam["id"]: cam for cam in cfg["cameras"]}
+    streams = {cid: CameraStream(cam, cfg) for cid, cam in cameras.items()}
+    app.extensions["streams"] = streams
+    placeholder = make_placeholder()
+
+    def get_stream(cam_id):
+        stream = streams.get(cam_id)
+        if stream is None:
+            abort(404, description=f"Камера {cam_id} не найдена")
+        return stream
+
+    @app.route("/")
+    def index():
+        public = [public_camera(c) for c in cfg["cameras"]]
+        if public:
+            center = [sum(c["lat"] for c in public) / len(public),
+                      sum(c["lng"] for c in public) / len(public)]
+        else:
+            center = cfg["map_center"]
+        return render_template("index.html", cameras=public,
+                               map_center=center, map_zoom=cfg["map_zoom"])
+
+    @app.route("/video/<int:cam_id>")
+    def video_feed(cam_id):
+        stream = get_stream(cam_id)
+
+        def generate():
+            last_id, last_sent = 0, time.monotonic()
+            while True:
+                last_id, frame = stream.wait_frame(last_id)
+                if frame is None:
+                    # Пока кадров нет, периодически шлём заглушку: так браузер
+                    # видит статус, а сервер замечает отключившегося клиента.
+                    if time.monotonic() - last_sent < 2:
+                        continue
+                    frame = placeholder
+                last_sent = time.monotonic()
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n"
+                       b"Content-Length: " + str(len(frame)).encode() +
+                       b"\r\n\r\n" + frame + b"\r\n")
+
+        return Response(generate(),
+                        mimetype="multipart/x-mixed-replace; boundary=frame",
+                        headers={"Cache-Control": "no-cache, no-store"})
+
+    @app.route("/snapshot/<int:cam_id>")
+    def snapshot(cam_id):
+        stream = get_stream(cam_id)
+        deadline = time.monotonic() + cfg["open_timeout_ms"] / 1000 + 1
+        frame = stream.frame
+        while frame is None and time.monotonic() < deadline:
+            _, frame = stream.wait_frame(0, timeout=0.5)
+        if frame is None:
+            abort(503, description="Кадр недоступен")
+        return Response(frame, mimetype="image/jpeg",
+                        headers={"Cache-Control": "no-cache, no-store"})
+
+    @app.route("/api/cameras")
+    def api_cameras():
+        return jsonify([{**public_camera(cameras[cid]), **s.status()}
+                        for cid, s in streams.items()])
+
+    return app
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    application = create_app()
     # host='0.0.0.0' позволяет подключиться с других устройств в сети
-    app.run(host='0.0.0.0', port=PORT, threaded=True, debug=False)
+    application.run(host=os.environ.get("HOST", "0.0.0.0"),
+                    port=application.config["VIEWER"]["port"],
+                    threaded=True, debug=False)

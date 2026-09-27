@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>RTSP Viewer + Map</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; background: #1a1a1a; color: #fff; }
+        #container { display: flex; height: 100vh; }
+        #sidebar {
+            width: 400px;
+            background: #2a2a2a;
+            padding: 15px;
+            overflow-y: auto;
+            border-right: 1px solid #444;
+        }
+        #sidebar h2 { margin-bottom: 15px; display: flex; justify-content: space-between; align-items: baseline; }
+        #sidebar h2 small { font-size: 12px; color: #999; font-weight: normal; }
+        #map-container { flex: 1; position: relative; }
+        #map { width: 100%; height: 100%; }
+        .camera-card {
+            background: #333;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            padding: 10px;
+            border: 1px solid #555;
+            cursor: pointer;
+            transition: border-color .2s;
+        }
+        .camera-card.active { border-color: #4fc3f7; }
+        .camera-card h3 { margin-bottom: 8px; font-size: 14px; color: #4fc3f7; }
+        .camera-card .video {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 16 / 9;
+            background: #000;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .camera-card img { width: 100%; height: 100%; object-fit: contain; display: block; }
+        .camera-card .fullscreen {
+            position: absolute; top: 6px; right: 6px;
+            background: rgba(0,0,0,.55); color: #fff; border: 0; border-radius: 4px;
+            padding: 2px 7px; font-size: 14px; cursor: pointer;
+        }
+        .camera-card .meta { display: flex; justify-content: space-between; margin-top: 6px; font-size: 11px; }
+        .camera-card .coords { color: #999; }
+        .status::before { content: "● "; }
+        .status.online { color: #4caf50; }
+        .status.connecting, .status.idle { color: #ffb300; }
+        .status.offline { color: #f44336; }
+        .empty { color: #999; font-size: 14px; }
+        .cam-marker {
+            width: 18px; height: 18px; border-radius: 50%;
+            border: 3px solid #fff; box-shadow: 0 0 4px rgba(0,0,0,.6);
+            background: #ffb300;
+        }
+        .cam-marker.online { background: #4caf50; }
+        .cam-marker.offline { background: #f44336; }
+        .popup-video { width: 280px; aspect-ratio: 16 / 9; margin-top: 5px; border-radius: 4px; background: #000; object-fit: contain; }
+
+        @media (max-width: 800px) {
+            #container { flex-direction: column-reverse; }
+            #sidebar { width: 100%; height: 50vh; border-right: 0; border-top: 1px solid #444; }
+            #map-container { height: 50vh; }
+        }
+    </style>
+</head>
+<body>
+<div id="container">
+    <div id="sidebar">
+        <h2>📹 Камеры <small id="summary"></small></h2>
+        {% for cam in cameras %}
+        <div class="camera-card" id="card-{{ cam.id }}" data-id="{{ cam.id }}">
+            <h3>{{ cam.name }} (ID: {{ cam.id }})</h3>
+            <div class="video">
+                <img src="/video/{{ cam.id }}" alt="Поток {{ cam.name }}" loading="lazy">
+                <button class="fullscreen" title="На весь экран">⛶</button>
+            </div>
+            <div class="meta">
+                <span class="coords">📍 {{ cam.lat }}, {{ cam.lng }}</span>
+                <span class="status connecting" id="status-{{ cam.id }}">Подключение…</span>
+            </div>
+        </div>
+        {% else %}
+        <p class="empty">Камеры не настроены. Добавьте их в cameras.json.</p>
+        {% endfor %}
+    </div>
+    <div id="map-container">
+        <div id="map"></div>
+    </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+    const cameras = {{ cameras | tojson }};
+    const mapCenter = {{ map_center | tojson }};
+    const mapZoom = {{ map_zoom | tojson }};
+
+    const STATUS_TEXT = {
+        online: "В сети",
+        connecting: "Подключение…",
+        idle: "Ожидание",
+        offline: "Нет сигнала",
+    };
+
+    const map = L.map('map').setView(mapCenter, mapZoom);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap contributors',
+        maxZoom: 19
+    }).addTo(map);
+
+    const markers = {};
+
+    function markerIcon(state) {
+        return L.divIcon({
+            className: '',
+            html: `<div class="cam-marker ${state}"></div>`,
+            iconSize: [18, 18],
+            iconAnchor: [9, 9],
+            popupAnchor: [0, -10],
+        });
+    }
+
+    function highlight(id) {
+        document.querySelectorAll('.camera-card').forEach(c =>
+            c.classList.toggle('active', c.dataset.id === String(id)));
+    }
+
+    function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, ch => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        })[ch]);
+    }
+
+    cameras.forEach(cam => {
+        const marker = L.marker([cam.lat, cam.lng], { icon: markerIcon('connecting'), title: cam.name })
+            .addTo(map);
+        marker.bindPopup('', { maxWidth: 300 });
+        // Видео в popup грузится только пока он открыт — иначе поток
+        // продолжал бы качаться в фоне
+        marker.on('popupopen', () => {
+            marker.setPopupContent(
+                `<b>${escapeHtml(cam.name)}</b><br>` +
+                `<img class="popup-video" src="/video/${cam.id}?popup=${Date.now()}">`);
+            highlight(cam.id);
+            document.getElementById(`card-${cam.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        });
+        marker.on('popupclose', () => {
+            const img = marker.getPopup().getElement()?.querySelector('img');
+            if (img) img.src = '';
+            marker.setPopupContent('');
+        });
+        markers[cam.id] = marker;
+    });
+
+    // Клик по карточке — показать камеру на карте
+    document.querySelectorAll('.camera-card').forEach(card => {
+        card.addEventListener('click', e => {
+            if (e.target.closest('.fullscreen')) return;
+            const cam = cameras.find(c => String(c.id) === card.dataset.id);
+            if (!cam) return;
+            highlight(cam.id);
+            map.flyTo([cam.lat, cam.lng], Math.max(map.getZoom(), 16));
+        });
+        card.querySelector('.fullscreen').addEventListener('click', e => {
+            e.stopPropagation();
+            const video = card.querySelector('.video');
+            (video.requestFullscreen || video.webkitRequestFullscreen)?.call(video);
+        });
+    });
+
+    if (cameras.length > 1) {
+        map.fitBounds(L.latLngBounds(cameras.map(c => [c.lat, c.lng])), { padding: [50, 50] });
+    }
+
+    // Реальный статус камер
+    async function refreshStatus() {
+        try {
+            const res = await fetch('/api/cameras', { cache: 'no-store' });
+            const list = await res.json();
+            let online = 0;
+            list.forEach(cam => {
+                if (cam.state === 'online') online++;
+                const el = document.getElementById(`status-${cam.id}`);
+                if (el) {
+                    el.className = `status ${cam.state}`;
+                    el.textContent = STATUS_TEXT[cam.state] || cam.state;
+                    if (cam.state === 'online' && cam.fps) el.textContent += ` · ${cam.fps} fps`;
+                    el.title = cam.error || '';
+                }
+                markers[cam.id]?.setIcon(markerIcon(cam.state));
+            });
+            document.getElementById('summary').textContent = `${online} / ${list.length} в сети`;
+        } catch (e) {
+            document.getElementById('summary').textContent = 'сервер недоступен';
+        }
+    }
+    refreshStatus();
+    setInterval(refreshStatus, 3000);
+</script>
+</body>
+</html>
